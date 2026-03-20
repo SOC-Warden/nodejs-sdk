@@ -1,0 +1,334 @@
+import { EventBuilder } from './builder';
+import {
+  CapturedContext,
+  EventPayload,
+  RequestContext,
+  SOCWardenOptions,
+  TrackOptions,
+} from './types';
+import { hostname } from 'os';
+
+const SDK_NAME = 'socwarden-node';
+const SDK_VERSION = '1.0.0';
+
+const BACKOFF_DURATION = 3600; // 1 hour in seconds
+const PROBE_INTERVAL = 300; // 5 minutes in seconds
+
+const SENSITIVE_PARAMS = ['token', 'key', 'password', 'secret', 'code', 'auth', 'session', 'csrf'];
+
+export class SOCWardenClient {
+  private readonly apiKey: string;
+  private readonly endpoint: string;
+  private readonly timeout: number;
+
+  /** In-memory backoff state for 429 handling. */
+  private backoffUntil: number = 0;
+  private lastProbe: number = 0;
+
+  /** Context captured by the Express middleware for the current request. */
+  private context: CapturedContext | null = null;
+
+  constructor(options: SOCWardenOptions) {
+    if (!options.apiKey) {
+      throw new Error('[SOCWarden] apiKey is required');
+    }
+
+    this.apiKey = options.apiKey;
+    this.endpoint = (options.endpoint ?? 'https://ingest.socwarden.io').replace(/\/+$/, '');
+    this.timeout = options.timeout ?? 5000;
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Public API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Track a security event using named arguments.
+   *
+   * ```ts
+   * await soc.track('auth.login.success', { actor: user.id });
+   * await soc.track('data.exported', {
+   *   actor: { id: user.id, email: user.email },
+   *   metadata: { format: 'csv' },
+   *   resource: { type: 'Report', id: report.id },
+   * });
+   * ```
+   */
+  async track(event: string, options?: TrackOptions): Promise<void> {
+    const data = options ? this.resolveNamedArgs(options) : {};
+    await this.dispatch(event, data);
+  }
+
+  /**
+   * Track a security event using a raw data object.
+   *
+   * ```ts
+   * await soc.trackData('auth.login.success', {
+   *   actor_id: user.id,
+   *   actor_email: user.email,
+   *   metadata: { role: 'admin' },
+   * });
+   * ```
+   */
+  async trackData(event: string, data: Record<string, unknown> = {}): Promise<void> {
+    await this.dispatch(event, data);
+  }
+
+  /**
+   * Start building an event with the fluent API.
+   *
+   * ```ts
+   * await soc.event('data.exported')
+   *   .actor(user.id)
+   *   .resource('Report', report.id)
+   *   .meta('format', 'csv')
+   *   .send();
+   * ```
+   */
+  event(name: string): EventBuilder {
+    return new EventBuilder(name, this);
+  }
+
+  /**
+   * Set the current request context. Called by the Express middleware.
+   */
+  setContext(context: CapturedContext): void {
+    this.context = context;
+  }
+
+  /**
+   * Clear the current request context. Called after request completes.
+   */
+  clearContext(): void {
+    this.context = null;
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Internal: argument resolution
+  // ---------------------------------------------------------------------------
+
+  private resolveNamedArgs(options: TrackOptions): Record<string, unknown> {
+    const data: Record<string, unknown> = {};
+
+    // Actor: object reads id + email; string is just id
+    if (options.actor !== undefined) {
+      if (typeof options.actor === 'string') {
+        data.actor_id = options.actor;
+      } else {
+        data.actor_id = options.actor.id;
+        if (options.actor.email) {
+          data.actor_email = options.actor.email;
+        }
+      }
+    }
+
+    // Explicit scalars override actor-resolved values
+    if (options.actorId !== undefined) {
+      data.actor_id = options.actorId;
+    }
+    if (options.actorEmail !== undefined) {
+      data.actor_email = options.actorEmail;
+    }
+    if (options.ip !== undefined) {
+      data.ip = options.ip;
+    }
+    if (options.userAgent !== undefined) {
+      data.user_agent = options.userAgent;
+    }
+    if (options.metadata !== undefined) {
+      data.metadata = { ...options.metadata };
+    }
+    if (options.timestamp !== undefined) {
+      data.timestamp =
+        options.timestamp instanceof Date
+          ? options.timestamp.toISOString()
+          : options.timestamp;
+    }
+
+    // Resource: object reads type + id; string is just type
+    if (options.resource !== undefined) {
+      const meta = (data.metadata ?? {}) as Record<string, unknown>;
+      if (typeof options.resource === 'string') {
+        meta.resource_type = options.resource;
+        if (options.resourceId !== undefined) {
+          meta.resource_id = options.resourceId;
+        }
+      } else {
+        meta.resource_type = options.resource.type;
+        meta.resource_id = options.resource.id;
+      }
+      data.metadata = meta;
+    }
+
+    // Remove undefined values
+    return Object.fromEntries(
+      Object.entries(data).filter(([, v]) => v !== undefined && v !== null),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Internal: dispatch and send
+  // ---------------------------------------------------------------------------
+
+  private async dispatch(event: string, data: Record<string, unknown>): Promise<void> {
+    const payload = this.buildPayload(event, data);
+    try {
+      await this.send(payload);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[SOCWarden] Failed to send event: ${message}`);
+    }
+  }
+
+  private buildPayload(event: string, data: Record<string, unknown>): EventPayload {
+    const payload: EventPayload = {
+      event,
+      source: 'sdk',
+    };
+
+    const fields = ['actor_id', 'actor_email', 'ip', 'user_agent', 'metadata', 'timestamp'] as const;
+    for (const field of fields) {
+      if (data[field] !== undefined) {
+        (payload as unknown as Record<string, unknown>)[field] = data[field];
+      }
+    }
+
+    // Attach auto-context if middleware captured it
+    payload.context = this.collectContext(data);
+
+    return payload;
+  }
+
+  private collectContext(data: Record<string, unknown>): RequestContext {
+    const context: RequestContext = {
+      sdk: {
+        name: SDK_NAME,
+        version: SDK_VERSION,
+      },
+      server: {
+        hostname: hostname(),
+        runtime: `Node.js ${process.version}`,
+        pid: process.pid,
+      },
+    };
+
+    if (this.context?.request) {
+      const req = this.context.request;
+      context.request = {
+        method: req.method,
+        path: req.path,
+      };
+
+      if (req.ip) {
+        context.request.ip = req.ip;
+      }
+      if (req.queryString) {
+        context.request.query_string = this.sanitizeQueryString(req.queryString);
+      }
+      if (req.referer) {
+        context.request.referer = req.referer;
+      }
+      if (req.origin) {
+        context.request.origin = req.origin;
+      }
+      if (req.contentType) {
+        context.request.content_type = req.contentType;
+      }
+      if (req.acceptLanguage) {
+        context.request.accept_language = req.acceptLanguage;
+      }
+      if (req.requestId) {
+        context.request.request_id = req.requestId;
+      }
+      if (req.userAgent) {
+        context.request.user_agent = req.userAgent;
+      }
+    }
+
+    // Attach browser context if relayed from browser SDK
+    if (this.context?.browser) {
+      context.browser = this.context.browser;
+    }
+
+    return context;
+  }
+
+  private sanitizeQueryString(qs: string): string {
+    if (!qs) return '';
+
+    return qs
+      .split('&')
+      .map((pair) => {
+        const [key, ...rest] = pair.split('=');
+        const paramName = key.toLowerCase();
+        const isSensitive = SENSITIVE_PARAMS.some((s) => paramName.includes(s));
+        if (isSensitive && rest.length > 0) {
+          return `${key}=[REDACTED]`;
+        }
+        return pair;
+      })
+      .join('&');
+  }
+
+  /**
+   * Send an event payload to the ingestor with 429 backoff handling.
+   *
+   * Backoff strategy (mirrors Laravel SDK):
+   *  - On 429: back off for Retry-After seconds (default 1 hour).
+   *  - During backoff: silently drop events, except for a probe every 5 minutes.
+   *  - On successful probe: clear backoff and resume normal sending.
+   */
+  private async send(payload: EventPayload): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+
+    // Check backoff
+    if (this.backoffUntil > 0 && now < this.backoffUntil) {
+      // During backoff, only send probes at PROBE_INTERVAL
+      if (now - this.lastProbe < PROBE_INTERVAL) {
+        return; // silently drop
+      }
+      this.lastProbe = now;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+    try {
+      const response = await fetch(`${this.endpoint}/v1/events`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      if (response.status === 429) {
+        const retryAfter = parseInt(response.headers.get('Retry-After') ?? '', 10);
+        const backoffSeconds = isNaN(retryAfter) ? BACKOFF_DURATION : retryAfter;
+        this.backoffUntil = now + backoffSeconds;
+        console.warn(
+          `[SOCWarden] Quota exceeded (429). Backing off for ${backoffSeconds}s`,
+        );
+        return;
+      }
+
+      // Clear backoff on any successful response
+      if (response.ok && this.backoffUntil > 0) {
+        this.backoffUntil = 0;
+        this.lastProbe = 0;
+        console.info('[SOCWarden] Quota restored, backoff cleared');
+      }
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        console.warn(
+          `[SOCWarden] Event send failed (HTTP ${response.status}): ${body}`,
+        );
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+}
