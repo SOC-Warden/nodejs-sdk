@@ -16,6 +16,23 @@ const PROBE_INTERVAL = 300; // 5 minutes in seconds
 
 const SENSITIVE_PARAMS = ['token', 'key', 'password', 'secret', 'code', 'auth', 'session', 'csrf'];
 
+/**
+ * Returns ip if it is a valid IPv4 or IPv6 address, otherwise undefined.
+ * Matches the ingestor's validate:"omitempty,ip" constraint.
+ */
+function sanitizeIP(ip: string | undefined): string | undefined {
+  if (!ip) return undefined;
+  // IPv4
+  const ipv4 = /^(\d{1,3}\.){3}\d{1,3}$/;
+  if (ipv4.test(ip)) {
+    const parts = ip.split('.').map(Number);
+    if (parts.every((p) => p >= 0 && p <= 255)) return ip;
+  }
+  // IPv6: contains colon and only hex digits and colons
+  if (ip.includes(':') && /^[0-9a-fA-F:]+$/.test(ip)) return ip;
+  return undefined;
+}
+
 export class SOCWardenClient {
   private readonly apiKey: string;
   private readonly endpoint: string;
@@ -130,7 +147,7 @@ export class SOCWardenClient {
       data.actor_email = options.actorEmail;
     }
     if (options.ip !== undefined) {
-      data.ip = options.ip;
+      data.ip = sanitizeIP(options.ip);
     }
     if (options.userAgent !== undefined) {
       data.user_agent = options.userAgent;
@@ -186,11 +203,14 @@ export class SOCWardenClient {
       source: 'sdk',
     };
 
-    const fields = ['actor_id', 'actor_email', 'ip', 'user_agent', 'metadata', 'timestamp'] as const;
+    const fields = ['actor_id', 'actor_email', 'user_agent', 'metadata', 'timestamp'] as const;
     for (const field of fields) {
       if (data[field] !== undefined) {
         (payload as unknown as Record<string, unknown>)[field] = data[field];
       }
+    }
+    if (data.ip !== undefined) {
+      (payload as unknown as Record<string, unknown>).ip = data.ip as string;
     }
 
     // Attach auto-context if middleware captured it
