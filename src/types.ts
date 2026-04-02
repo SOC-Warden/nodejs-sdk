@@ -76,6 +76,7 @@ export interface RequestContext {
     method: string;
     path: string;
     ip?: string;
+    user_agent?: string;
     query_string?: string;
     referer?: string;
     origin?: string;
