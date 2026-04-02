@@ -352,6 +352,40 @@ describe('SOCWardenClient constructor', () => {
   });
 });
 
+describe('sanitizeIP', () => {
+  const originalFetch = globalThis.fetch;
+  let lastBody: Record<string, unknown>;
+
+  beforeEach(() => {
+    globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      lastBody = JSON.parse(init?.body as string);
+      return mockResponse(202);
+    };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('strips invalid IP before sending', async () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://test.local' });
+    await client.track('auth.login.success', { ip: 'not-an-ip' });
+    assert.strictEqual(lastBody.ip, undefined);
+  });
+
+  it('keeps valid IPv4 address', async () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://test.local' });
+    await client.track('auth.login.success', { ip: '10.0.0.1' });
+    assert.strictEqual(lastBody.ip, '10.0.0.1');
+  });
+
+  it('keeps valid IPv6 address', async () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://test.local' });
+    await client.track('auth.login.success', { ip: '2001:db8::1' });
+    assert.strictEqual(lastBody.ip, '2001:db8::1');
+  });
+});
+
 describe('track() named args resolution', () => {
   const originalFetch = globalThis.fetch;
   let lastBody: Record<string, unknown>;
