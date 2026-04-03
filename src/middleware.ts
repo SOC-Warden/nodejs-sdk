@@ -1,5 +1,7 @@
 import type { SOCWardenClient } from './client';
+import { requestContextStorage } from './context';
 import type { CapturedContext } from './types';
+export { requestContextStorage } from './context';
 
 /**
  * Minimal Express-compatible request interface.
@@ -43,7 +45,12 @@ type NextFunction = (err?: unknown) => void;
  * ```
  */
 export function socwardenMiddleware(client: SOCWardenClient) {
-  return (req: ExpressRequest, res: ExpressResponse, next: NextFunction): void => {
+  // D4 FIX: client parameter retained for API compatibility but context is now
+  // stored in AsyncLocalStorage instead of on the shared singleton instance,
+  // preventing concurrent request context contamination.
+  void client;
+
+  return (req: ExpressRequest, _res: ExpressResponse, next: NextFunction): void => {
     const queryString = buildQueryString(req.query);
 
     const capturedContext: CapturedContext = {
@@ -65,29 +72,13 @@ export function socwardenMiddleware(client: SOCWardenClient) {
       },
     };
 
-    // Merge browser context from X-SOCWarden-Context header (sent by browser SDK relay mode)
-    const browserContextHeader = req.get('x-socwarden-context');
-    if (browserContextHeader) {
-      try {
-        const decoded = JSON.parse(
-          Buffer.from(browserContextHeader, 'base64').toString('utf-8'),
-        );
-        if (typeof decoded === 'object' && decoded !== null) {
-          capturedContext.browser = decoded;
-        }
-      } catch {
-        // Malformed header — ignore silently
-      }
-    }
+    // D1 FIX: X-SOCWarden-Context header removed — trusting arbitrary HTTP headers
+    // allows any client to spoof server-side metadata. Server context is collected
+    // locally by the SDK and must not be merged from incoming request headers.
 
-    client.setContext(capturedContext);
-
-    // Clear context when the response finishes to avoid leaking between requests
-    res.on('finish', () => {
-      client.clearContext();
-    });
-
-    next();
+    // D4 FIX: Run the rest of the request handling within the AsyncLocalStorage
+    // context so each concurrent request has its own isolated context.
+    requestContextStorage.run(capturedContext, next);
   };
 }
 

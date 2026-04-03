@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
 import { SOCWardenClient } from '../client';
 import { EventBuilder } from '../builder';
-import { socwardenMiddleware } from '../middleware';
+import { socwardenMiddleware, requestContextStorage } from '../middleware';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -176,35 +176,43 @@ describe('SOCWardenClient', () => {
 
   // -----------------------------------------------------------------------
   // 6. sanitizeQueryString redacts sensitive params
+  // D4 FIX: Context is now stored in AsyncLocalStorage — inject via
+  // requestContextStorage.run() instead of the deprecated client.setContext().
   // -----------------------------------------------------------------------
   it('sanitizeQueryString redacts sensitive params', async () => {
     const client = new SOCWardenClient({ apiKey: 'sk_test_123', endpoint: 'https://test.local' });
 
-    // Set context with a query string containing sensitive params
-    client.setContext({
-      request: {
-        method: 'GET',
-        path: '/api/data',
-        queryString: 'token=abc123&name=test&password=hunter2&api_key=sk_live&safe=yes',
+    // D4 FIX: Use AsyncLocalStorage to set per-request context instead of
+    // the shared singleton client.setContext() (which is now a no-op).
+    await requestContextStorage.run(
+      {
+        request: {
+          method: 'GET',
+          path: '/api/data',
+          queryString: 'token=abc123&name=test&password=hunter2&api_key=sk_live&safe=yes',
+        },
+        sdk: { name: 'socwarden-node', version: '1.0.0' },
       },
-      sdk: { name: 'socwarden-node', version: '1.0.0' },
-    });
+      async () => {
+        await client.track('test.event');
 
-    await client.track('test.event');
-
-    const body = JSON.parse(capturedInit.body as string);
-    const qs = body.context.request.query_string;
-    assert.ok(qs.includes('token=[REDACTED]'), 'token should be redacted');
-    assert.ok(qs.includes('name=test'), 'name should not be redacted');
-    assert.ok(qs.includes('password=[REDACTED]'), 'password should be redacted');
-    assert.ok(qs.includes('api_key=[REDACTED]'), 'api_key should be redacted');
-    assert.ok(qs.includes('safe=yes'), 'safe should not be redacted');
-
-    client.clearContext();
+        const body = JSON.parse(capturedInit.body as string);
+        const qs = body.context.request.query_string;
+        assert.ok(qs.includes('token=[REDACTED]'), 'token should be redacted');
+        assert.ok(qs.includes('name=test'), 'name should not be redacted');
+        assert.ok(qs.includes('password=[REDACTED]'), 'password should be redacted');
+        assert.ok(qs.includes('api_key=[REDACTED]'), 'api_key should be redacted');
+        assert.ok(qs.includes('safe=yes'), 'safe should not be redacted');
+      },
+    );
   });
 
   // -----------------------------------------------------------------------
   // 7. Middleware captures request context
+  // D4 FIX: After the AsyncLocalStorage fix, context is only visible inside
+  // the requestContextStorage.run() callback. In real Express usage, next()
+  // continues the request handling chain synchronously within that callback,
+  // so route handlers (and their track() calls) are properly covered.
   // -----------------------------------------------------------------------
   it('middleware captures request context from Express-like req/res', async () => {
     const client = new SOCWardenClient({ apiKey: 'sk_test_123', endpoint: 'https://test.local' });
@@ -225,26 +233,27 @@ describe('SOCWardenClient', () => {
       get: (header: string) => headers[header.toLowerCase()],
     };
 
-    // Mock Express response
-    let finishCallback: (() => void) | null = null;
-    const res = {
-      on: (event: string, cb: () => void) => {
-        if (event === 'finish') finishCallback = cb;
-      },
+    // Mock Express response (finish callback no longer needed — AsyncLocalStorage
+    // scopes context to the async context, not via explicit clearContext()).
+    const res = { on: (_event: string, _cb: () => void) => {} };
+
+    // D4 FIX: Track is called inside the next() callback, which is what Express
+    // does — next() runs inside requestContextStorage.run() so the context is visible.
+    let body: any;
+    const next = async () => {
+      // This simulates a route handler calling track() during request processing.
+      await client.track('auth.login.success', { actor: 'usr_1' });
+      body = JSON.parse(capturedInit.body as string);
     };
 
-    // Mock next function
-    let nextCalled = false;
-    const next = () => { nextCalled = true; };
+    // Invoke middleware — next() runs inside the AsyncLocalStorage context.
+    await new Promise<void>((resolve) => {
+      middleware(req, res, async () => {
+        await next();
+        resolve();
+      });
+    });
 
-    // Invoke middleware
-    middleware(req, res, next);
-    assert.ok(nextCalled, 'next() should have been called');
-
-    // Now track an event — it should pick up the request context
-    await client.track('auth.login.success', { actor: 'usr_1' });
-
-    const body = JSON.parse(capturedInit.body as string);
     assert.ok(body.context.request, 'request context should be present');
     assert.strictEqual(body.context.request.method, 'POST');
     assert.strictEqual(body.context.request.path, '/api/auth/login');
@@ -255,14 +264,11 @@ describe('SOCWardenClient', () => {
     assert.strictEqual(body.context.request.request_id, 'req_abc123');
     assert.ok(body.context.request.query_string, 'query_string should be present');
 
-    // Simulate response finish — should clear context
-    assert.ok(finishCallback, 'finish callback should have been registered');
-    finishCallback!();
-
-    // Track again — context should be cleared
+    // After the middleware run() scope exits, context is automatically gone.
+    // Track outside the scope — no request context should be present.
     await client.track('auth.logout');
     const body2 = JSON.parse(capturedInit.body as string);
-    assert.strictEqual(body2.context.request, undefined, 'request context should be cleared after finish');
+    assert.strictEqual(body2.context.request, undefined, 'request context should be absent outside middleware scope');
   });
 });
 

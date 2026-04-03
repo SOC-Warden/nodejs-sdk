@@ -1,12 +1,12 @@
 import { EventBuilder } from './builder';
 import {
-  CapturedContext,
   EventPayload,
   RequestContext,
   SOCWardenOptions,
   TrackOptions,
 } from './types';
 import { hostname } from 'os';
+import { requestContextStorage } from './context';
 
 const SDK_NAME = 'socwarden-node';
 const SDK_VERSION = '1.0.0';
@@ -42,8 +42,8 @@ export class SOCWardenClient {
   private backoffUntil: number = 0;
   private lastProbe: number = 0;
 
-  /** Context captured by the Express middleware for the current request. */
-  private context: CapturedContext | null = null;
+  // D4 FIX: Per-request context is now stored in AsyncLocalStorage (see middleware.ts)
+  // rather than on the shared instance, preventing concurrent request contamination.
 
   constructor(options: SOCWardenOptions) {
     if (!options.apiKey) {
@@ -53,6 +53,14 @@ export class SOCWardenClient {
     this.apiKey = options.apiKey;
     this.endpoint = (options.endpoint ?? 'https://ingest.socwarden.io').replace(/\/+$/, '');
     this.timeout = options.timeout ?? 5000;
+
+    // D2 FIX: Enforce HTTPS to prevent API key transmission in cleartext.
+    if (!this.endpoint.startsWith('https://')) {
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('[SOCWarden] Endpoint must use HTTPS in production. API keys must not be transmitted in cleartext.');
+      }
+      console.warn('[SOCWarden] WARNING: Endpoint is using HTTP. API keys will be transmitted in cleartext.');
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -107,17 +115,20 @@ export class SOCWardenClient {
   }
 
   /**
-   * Set the current request context. Called by the Express middleware.
+   * @deprecated No-op — context is now stored per-request in AsyncLocalStorage.
+   * Kept for API compatibility only; will be removed in a future major version.
    */
-  setContext(context: CapturedContext): void {
-    this.context = context;
+  setContext(): void {
+    // D4 FIX: Context is stored in AsyncLocalStorage by the middleware.
+    // This method is intentionally a no-op.
   }
 
   /**
-   * Clear the current request context. Called after request completes.
+   * @deprecated No-op — context is now stored per-request in AsyncLocalStorage.
+   * Kept for API compatibility only; will be removed in a future major version.
    */
   clearContext(): void {
-    this.context = null;
+    // D4 FIX: AsyncLocalStorage context is automatically scoped to the request.
   }
 
   // ---------------------------------------------------------------------------
@@ -187,7 +198,17 @@ export class SOCWardenClient {
   //  Internal: dispatch and send
   // ---------------------------------------------------------------------------
 
+  // D3 FIX: Validate event_type format before sending to the ingestor.
+  private static readonly EVENT_TYPE_REGEX = /^[a-z][a-z0-9]{0,29}(\.[a-z][a-z0-9_]{0,29}){1,3}$/;
+
   private async dispatch(event: string, data: Record<string, unknown>): Promise<void> {
+    // D3 FIX: Validate event type format before sending.
+    if (!SOCWardenClient.EVENT_TYPE_REGEX.test(event)) {
+      console.warn(`[SOCWarden] Invalid event type format, dropping event: "${event}". ` +
+        'Event types must match ^[a-z][a-z0-9]{0,29}(\\.[a-z][a-z0-9_]{0,29}){1,3}$');
+      return;
+    }
+
     const payload = this.buildPayload(event, data);
     try {
       await this.send(payload);
@@ -232,8 +253,11 @@ export class SOCWardenClient {
       },
     };
 
-    if (this.context?.request) {
-      const req = this.context.request;
+    // D4 FIX: Read per-request context from AsyncLocalStorage instead of the
+    // shared instance property to prevent concurrent request contamination.
+    const requestCtx = requestContextStorage.getStore();
+    if (requestCtx?.request) {
+      const req = requestCtx.request;
       context.request = {
         method: req.method,
         path: req.path,
@@ -265,10 +289,8 @@ export class SOCWardenClient {
       }
     }
 
-    // Attach browser context if relayed from browser SDK
-    if (this.context?.browser) {
-      context.browser = this.context.browser;
-    }
+    // D1 FIX: Browser context from X-SOCWarden-Context header removed —
+    // trusting arbitrary HTTP headers allows spoofing of server-side metadata.
 
     return context;
   }
