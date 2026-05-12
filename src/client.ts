@@ -51,7 +51,7 @@ export class SOCWardenClient {
     }
 
     this.apiKey = options.apiKey;
-    this.endpoint = (options.endpoint ?? 'https://ingest.socwarden.io').replace(/\/+$/, '');
+    this.endpoint = (options.endpoint ?? 'https://ingest.socwarden.com').replace(/\/+$/, '');
     this.timeout = options.timeout ?? 5000;
 
     // D2 FIX: Enforce HTTPS to prevent API key transmission in cleartext.
