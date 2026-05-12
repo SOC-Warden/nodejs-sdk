@@ -4,7 +4,7 @@
 export interface SOCWardenOptions {
   /** API key for authenticating with the SOCWarden ingestor. */
   apiKey: string;
-  /** Ingestor endpoint URL. Defaults to https://ingest.socwarden.com */
+  /** Ingestor endpoint URL. Defaults to https://ingestor.socwarden.com */
   endpoint?: string;
   /** HTTP request timeout in milliseconds. Defaults to 5000. */
   timeout?: number;

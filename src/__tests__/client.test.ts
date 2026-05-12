@@ -342,6 +342,42 @@ describe('SOCWardenClient constructor', () => {
     );
   });
 
+  it('throws when timeout is 0', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', timeout: 0 }),
+      /timeout must be a positive integer/,
+    );
+  });
+
+  it('throws when timeout is negative', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', timeout: -1 }),
+      /timeout must be a positive integer/,
+    );
+  });
+
+  it('throws when timeout is Infinity', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', timeout: Infinity }),
+      /timeout must be a positive integer/,
+    );
+  });
+
+  it('throws when timeout exceeds 300000ms', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', timeout: 300001 }),
+      /timeout must be a positive integer/,
+    );
+  });
+
+  it('accepts valid timeout of 1ms', () => {
+    assert.doesNotThrow(() => new SOCWardenClient({ apiKey: 'sk_test', timeout: 1 }));
+  });
+
+  it('accepts valid timeout of 300000ms', () => {
+    assert.doesNotThrow(() => new SOCWardenClient({ apiKey: 'sk_test', timeout: 300000 }));
+  });
+
   it('strips trailing slashes from endpoint', async () => {
     const originalFetch = globalThis.fetch;
     let capturedUrl = '';

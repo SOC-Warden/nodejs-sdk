@@ -119,6 +119,14 @@ export class EventBuilder {
    * ```
    */
   meta(key: string, value: unknown): this {
+    // Guard against __proto__ / constructor prototype-chain keys.
+    // A user-controlled key of '__proto__' passed to bracket-notation assignment
+    // (existing[key] = value) silently corrupts the object's prototype chain,
+    // causing JSON.stringify to produce {} and dropping all metadata.
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      console.warn(`[SOCWarden] Metadata key "${key}" is reserved and will be ignored.`);
+      return this;
+    }
     const existing = (this.data.metadata as Record<string, unknown>) ?? {};
     existing[key] = value;
     this.data.metadata = existing;

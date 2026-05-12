@@ -11,7 +11,8 @@ import { requestContextStorage } from './context';
 const SDK_NAME = 'socwarden-node';
 const SDK_VERSION = '1.0.0';
 
-const BACKOFF_DURATION = 3600; // 1 hour in seconds
+const BACKOFF_DURATION = 3600; // 1 hour in seconds (default when no Retry-After header)
+const MAX_BACKOFF_DURATION = 86400; // 24 hours — hard cap to prevent DoS via large Retry-After
 const PROBE_INTERVAL = 300; // 5 minutes in seconds
 
 const SENSITIVE_PARAMS = ['token', 'key', 'password', 'secret', 'code', 'auth', 'session', 'csrf'];
@@ -51,8 +52,16 @@ export class SOCWardenClient {
     }
 
     this.apiKey = options.apiKey;
-    this.endpoint = (options.endpoint ?? 'https://ingest.socwarden.com').replace(/\/+$/, '');
-    this.timeout = options.timeout ?? 5000;
+    this.endpoint = (options.endpoint ?? 'https://ingestor.socwarden.com').replace(/\/+$/, '');
+
+    // Validate timeout: must be a positive finite integer in [1, 300_000] ms.
+    const rawTimeout = options.timeout ?? 5000;
+    if (!Number.isFinite(rawTimeout) || rawTimeout <= 0 || rawTimeout > 300_000) {
+      throw new Error(
+        `[SOCWarden] timeout must be a positive integer between 1 and 300000 ms (got ${rawTimeout}).`,
+      );
+    }
+    this.timeout = rawTimeout;
 
     // D2 FIX: Enforce HTTPS to prevent API key transmission in cleartext.
     if (!this.endpoint.startsWith('https://')) {
@@ -204,7 +213,10 @@ export class SOCWardenClient {
   private async dispatch(event: string, data: Record<string, unknown>): Promise<void> {
     // D3 FIX: Validate event type format before sending.
     if (!SOCWardenClient.EVENT_TYPE_REGEX.test(event)) {
-      console.warn(`[SOCWarden] Invalid event type format, dropping event: "${event}". ` +
+      // Truncate and strip control characters from event name before logging to prevent
+      // log injection attacks via crafted multiline event names.
+      const safeEvent = String(event).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 100);
+      console.warn(`[SOCWarden] Invalid event type format, dropping event: "${safeEvent}". ` +
         'Event types must match ^[a-z][a-z0-9]{0,29}(\\.[a-z][a-z0-9_]{0,29}){1,3}$');
       return;
     }
@@ -263,8 +275,11 @@ export class SOCWardenClient {
         path: req.path,
       };
 
-      if (req.ip) {
-        context.request.ip = req.ip;
+      // Sanitize context IP the same way as track()'s ip option, so a spoofed
+      // X-Forwarded-For header cannot inject a malformed value.
+      const sanitizedContextIp = sanitizeIP(req.ip);
+      if (sanitizedContextIp) {
+        context.request.ip = sanitizedContextIp;
       }
       if (req.queryString) {
         context.request.query_string = this.sanitizeQueryString(req.queryString);
@@ -348,7 +363,10 @@ export class SOCWardenClient {
 
       if (response.status === 429) {
         const retryAfter = parseInt(response.headers.get('Retry-After') ?? '', 10);
-        const backoffSeconds = isNaN(retryAfter) ? BACKOFF_DURATION : retryAfter;
+        // Cap Retry-After to MAX_BACKOFF_DURATION to prevent a malicious or
+        // misconfigured server from permanently blocking all event sending (DoS).
+        const rawBackoff = isNaN(retryAfter) || retryAfter <= 0 ? BACKOFF_DURATION : retryAfter;
+        const backoffSeconds = Math.min(rawBackoff, MAX_BACKOFF_DURATION);
         this.backoffUntil = now + backoffSeconds;
         console.warn(
           `[SOCWarden] Quota exceeded (429). Backing off for ${backoffSeconds}s`,

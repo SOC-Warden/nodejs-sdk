@@ -15,7 +15,7 @@ import { SOCWardenClient } from '@socwarden/sdk';
 
 const soc = new SOCWardenClient({
   apiKey: 'sk_live_...',
-  // endpoint: 'https://ingest.socwarden.com', // default
+  // endpoint: 'https://ingestor.socwarden.com', // default
   // timeout: 5000, // default, in ms
 });
 ```
