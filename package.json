@@ -1,6 +1,6 @@
 {
   "name": "@socwarden/sdk",
-  "version": "0.0.1",
+  "version": "0.0.1-alpha.1",
   "description": "SOCWarden Node.js/TypeScript SDK for security event tracking",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
