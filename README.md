@@ -1,6 +1,6 @@
 # @socwarden/sdk
 
-Node.js/TypeScript SDK for [SOCWarden](https://socwarden.io) security event tracking.
+Node.js/TypeScript SDK for [SOCWarden](https://socwarden.com) security event tracking.
 
 ## Installation
 
@@ -15,7 +15,7 @@ import { SOCWardenClient } from '@socwarden/sdk';
 
 const soc = new SOCWardenClient({
   apiKey: 'sk_live_...',
-  // endpoint: 'https://ingest.socwarden.io', // default
+  // endpoint: 'https://ingest.socwarden.com', // default
   // timeout: 5000, // default, in ms
 });
 ```
