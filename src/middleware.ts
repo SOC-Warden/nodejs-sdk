@@ -57,7 +57,15 @@ export function socwardenMiddleware(client: SOCWardenClient) {
       request: {
         method: req.method,
         path: req.path,
-        ip: req.ip ?? req.get('x-forwarded-for')?.split(',')[0].trim(),
+        // SEC-NOTE (M4 — IP Spoofing): req.ip is Express's pre-trusted value (set by the
+      // framework after applying the `trust proxy` setting). When req.ip is absent we fall
+      // back to the first value in X-Forwarded-For, which is client-controlled and can be
+      // spoofed. Applications MUST configure `app.set('trust proxy', N)` (where N is the
+      // number of trusted proxy hops) so that Express populates req.ip from the correct
+      // hop rather than from the raw client socket. The SDK sanitizes the final IP value
+      // via sanitizeIP() to reject non-IP strings, but it cannot prevent a client from
+      // supplying a valid-looking but wrong IP when no trusted-proxy config is in place.
+      ip: req.ip ?? req.get('x-forwarded-for')?.split(',')[0].trim(),
         userAgent: req.get('user-agent'),
         queryString,
         referer: req.get('referer'),

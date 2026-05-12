@@ -426,6 +426,224 @@ describe('sanitizeIP', () => {
     await client.track('auth.login.success', { ip: '2001:db8::1' });
     assert.strictEqual(lastBody.ip, '2001:db8::1');
   });
+
+  // SEC-FIX M2: malformed IPv6 strings that previously passed the colon+hex regex
+  // must now be rejected by the stricter net.isIPv6() check.
+  it('rejects malformed IPv6 string ":::" (was accepted before M2 fix)', async () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://test.local' });
+    await client.track('auth.login.success', { ip: ':::' });
+    assert.strictEqual(lastBody.ip, undefined);
+  });
+
+  it('rejects malformed IPv6 string "ffff::::::::::::::::::::::::::::" (M2 fix)', async () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://test.local' });
+    await client.track('auth.login.success', { ip: 'ffff::::::::::::::::::::::::::::' });
+    assert.strictEqual(lastBody.ip, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security: SSRF protection on endpoint URL (H3 fix)
+// ---------------------------------------------------------------------------
+describe('SSRF protection on endpoint URL', () => {
+  it('throws on file:// scheme', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'file:///etc/passwd' }),
+      /scheme must be https:\/\/ or http:\/\//,
+    );
+  });
+
+  it('throws on ftp:// scheme', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'ftp://evil.com' }),
+      /scheme must be https:\/\/ or http:\/\//,
+    );
+  });
+
+  it('throws on data: scheme', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'data:text/plain,evil' }),
+      /scheme must be https:\/\/ or http:\/\//,
+    );
+  });
+
+  it('throws on localhost endpoint', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://localhost:9200' }),
+      /private or reserved address/,
+    );
+  });
+
+  it('throws on 127.0.0.1 loopback endpoint', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://127.0.0.1:8080' }),
+      /private or reserved address/,
+    );
+  });
+
+  it('throws on AWS metadata endpoint 169.254.169.254', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://169.254.169.254' }),
+      /private or reserved address/,
+    );
+  });
+
+  it('throws on RFC-1918 10.x.x.x endpoint', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://10.0.0.1' }),
+      /private or reserved address/,
+    );
+  });
+
+  it('throws on RFC-1918 192.168.x.x endpoint', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://192.168.1.100' }),
+      /private or reserved address/,
+    );
+  });
+
+  it('throws on RFC-1918 172.16.x.x endpoint', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://172.16.0.1' }),
+      /private or reserved address/,
+    );
+  });
+
+  it('throws on invalid URL', () => {
+    assert.throws(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'not-a-url' }),
+      /Invalid endpoint URL/,
+    );
+  });
+
+  it('accepts a valid public HTTPS endpoint', () => {
+    assert.doesNotThrow(
+      () => new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://ingestor.socwarden.com' }),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security: API key serialization protection (M3 fix)
+// ---------------------------------------------------------------------------
+describe('API key serialization protection', () => {
+  it('toJSON() redacts the apiKey', () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_live_supersecret', endpoint: 'https://test.local' });
+    const json = JSON.stringify(client);
+    assert.ok(!json.includes('sk_live_supersecret'), 'apiKey must not appear in JSON.stringify output');
+    assert.ok(json.includes('[REDACTED]'), 'apiKey must be shown as [REDACTED] in JSON output');
+  });
+
+  it('inspect symbol redacts the apiKey', () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_live_supersecret', endpoint: 'https://test.local' });
+    const inspectFn = (client as unknown as Record<symbol, () => string>)[Symbol.for('nodejs.util.inspect.custom')];
+    const inspected = inspectFn.call(client);
+    assert.ok(!inspected.includes('sk_live_supersecret'), 'apiKey must not appear in util.inspect output');
+    assert.ok(inspected.includes('[REDACTED]'), 'apiKey must be shown as [REDACTED] in inspect output');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security: Log injection prevention via response body (H1/H2 fix)
+// ---------------------------------------------------------------------------
+describe('Log injection prevention in error response body', () => {
+  const originalFetch = globalThis.fetch;
+  const warnMessages: string[] = [];
+  const originalWarn = console.warn;
+
+  beforeEach(() => {
+    warnMessages.length = 0;
+    console.warn = (...args: unknown[]) => { warnMessages.push(args.join(' ')); };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  });
+
+  it('strips newlines from error response body (H1: log injection)', async () => {
+    globalThis.fetch = async (): Promise<Response> =>
+      mockResponse(400, 'error\n[FAKE] Admin password reset\nAll good');
+
+    const client = new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://test.local' });
+    await client.track('test.event');
+
+    assert.ok(warnMessages.some((m) => m.includes('Event send failed')), 'should log failure');
+    const logLine = warnMessages.find((m) => m.includes('Event send failed')) ?? '';
+    assert.ok(!logLine.includes('\n'), 'log message must not contain newlines after sanitization');
+  });
+
+  it('truncates oversized response body to MAX_ERROR_BODY_BYTES (H2: memory/log DoS)', async () => {
+    const hugeBody = 'x'.repeat(100_000);
+    globalThis.fetch = async (): Promise<Response> => mockResponse(500, hugeBody);
+
+    const client = new SOCWardenClient({ apiKey: 'sk_test', endpoint: 'https://test.local' });
+    await client.track('test.event');
+
+    const logLine = warnMessages.find((m) => m.includes('Event send failed')) ?? '';
+    // The log message must be much shorter than the original body
+    assert.ok(logLine.length < 1000, `log message too long (${logLine.length} chars); body should be truncated`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security: meta() key guard completeness (L2 fix)
+// ---------------------------------------------------------------------------
+describe('EventBuilder meta() key guard', () => {
+  it('blocks __proto__ key', () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test' });
+    const warnMessages: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnMessages.push(args.join(' ')); };
+
+    try {
+      const builder = new EventBuilder('test.event', client);
+      builder.meta('__proto__', { hacked: true });
+      // Prototype must not be polluted
+      assert.strictEqual(({} as Record<string, unknown>).hacked, undefined);
+      // The meta() call should have warned
+      assert.ok(warnMessages.some((m) => m.includes('reserved')), 'should warn about reserved key');
+      // metadata should be absent or not contain __proto__ as own property
+      const obj = builder.toObject();
+      const meta = obj.metadata as Record<string, unknown> | undefined;
+      if (meta != null) {
+        assert.ok(
+          !Object.prototype.hasOwnProperty.call(meta, '__proto__'),
+          '__proto__ must not be in metadata',
+        );
+      }
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it('blocks valueOf key', () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test' });
+    const warnMessages: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnMessages.push(args.join(' ')); };
+
+    try {
+      new EventBuilder('test.event', client).meta('valueOf', 'evil');
+      assert.ok(warnMessages.some((m) => m.includes('reserved')), 'should warn about reserved key');
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it('blocks toString key', () => {
+    const client = new SOCWardenClient({ apiKey: 'sk_test' });
+    const warnMessages: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnMessages.push(args.join(' ')); };
+
+    try {
+      new EventBuilder('test.event', client).meta('toString', 'evil');
+      assert.ok(warnMessages.some((m) => m.includes('reserved')), 'should warn about reserved key');
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
 });
 
 describe('track() named args resolution', () => {

@@ -6,6 +6,7 @@ import {
   TrackOptions,
 } from './types';
 import { hostname } from 'os';
+import { isIPv4, isIPv6 } from 'net';
 import { requestContextStorage } from './context';
 
 const SDK_NAME = 'socwarden-node';
@@ -20,18 +21,80 @@ const SENSITIVE_PARAMS = ['token', 'key', 'password', 'secret', 'code', 'auth', 
 /**
  * Returns ip if it is a valid IPv4 or IPv6 address, otherwise undefined.
  * Matches the ingestor's validate:"omitempty,ip" constraint.
+ * Uses Node.js net.isIPv4/isIPv6 for strict RFC-compliant validation instead of
+ * a regex, which previously allowed malformed IPv6 strings like ':::'.
  */
 function sanitizeIP(ip: string | undefined): string | undefined {
   if (!ip) return undefined;
-  // IPv4
-  const ipv4 = /^(\d{1,3}\.){3}\d{1,3}$/;
-  if (ipv4.test(ip)) {
-    const parts = ip.split('.').map(Number);
-    if (parts.every((p) => p >= 0 && p <= 255)) return ip;
-  }
-  // IPv6: contains colon and only hex digits and colons
-  if (ip.includes(':') && /^[0-9a-fA-F:]+$/.test(ip)) return ip;
+  if (isIPv4(ip) || isIPv6(ip)) return ip;
   return undefined;
+}
+
+/**
+ * Maximum number of bytes we read from an error response body before truncating.
+ * Prevents memory exhaustion (DoS) when a misconfigured or malicious server
+ * returns a very large response body that we would otherwise fully buffer via text().
+ * Also prevents log flooding.
+ */
+const MAX_ERROR_BODY_BYTES = 512;
+
+/**
+ * Sanitize a string for safe inclusion in a single log line.
+ * Strips ASCII control characters (including CR/LF) to prevent log injection:
+ * a server-controlled body containing newlines could otherwise forge additional
+ * log entries that appear to come from the SDK (e.g. fake "Auth successful" lines).
+ */
+function sanitizeForLog(s: string): string {
+  return s.replace(/[\x00-\x1f\x7f]/g, '').slice(0, MAX_ERROR_BODY_BYTES);
+}
+
+/**
+ * Validate that the configured endpoint URL:
+ *   1. Uses a safe scheme (https:// or http://).
+ *   2. Does NOT resolve to a private/loopback/link-local address — this prevents
+ *      Server-Side Request Forgery (SSRF) where a developer passes a user-supplied
+ *      URL and the SDK would send the Bearer API key to an internal service.
+ *
+ * Note: scheme-level validation happens here; the SSRF block covers the most
+ * dangerous cases (cloud metadata endpoints, localhost, RFC-1918 ranges).
+ */
+function validateEndpointURL(raw: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`[SOCWarden] Invalid endpoint URL: "${raw}"`);
+  }
+
+  const scheme = parsed.protocol; // includes trailing ':'
+  if (scheme !== 'https:' && scheme !== 'http:') {
+    throw new Error(
+      `[SOCWarden] Endpoint URL scheme must be https:// or http:// (got "${scheme}"). ` +
+        'Schemes like file://, ftp://, data: or javascript: are not permitted.',
+    );
+  }
+
+  // Block SSRF targets: loopback, link-local (cloud metadata), RFC-1918 ranges.
+  const host = parsed.hostname;
+  const ssrfPatterns: RegExp[] = [
+    /^localhost$/i,
+    /^127\.\d+\.\d+\.\d+$/,           // 127.0.0.0/8 (loopback)
+    /^::1$/,                            // IPv6 loopback
+    /^169\.254\.\d+\.\d+$/,            // 169.254.0.0/16 — link-local / cloud metadata
+    /^10\.\d+\.\d+\.\d+$/,             // 10.0.0.0/8     — RFC-1918
+    /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/, // 172.16.0.0/12 — RFC-1918
+    /^192\.168\.\d+\.\d+$/,            // 192.168.0.0/16 — RFC-1918
+    /^fd[0-9a-f]{2}:/i,                // IPv6 ULA fc00::/7
+    /^fe80:/i,                          // IPv6 link-local
+  ];
+  for (const pattern of ssrfPatterns) {
+    if (pattern.test(host)) {
+      throw new Error(
+        `[SOCWarden] Endpoint hostname "${host}" resolves to a private or reserved address range. ` +
+          'Configuring the SDK to send events to internal network addresses is not permitted (SSRF prevention).',
+      );
+    }
+  }
 }
 
 export class SOCWardenClient {
@@ -52,7 +115,17 @@ export class SOCWardenClient {
     }
 
     this.apiKey = options.apiKey;
-    this.endpoint = (options.endpoint ?? 'https://ingestor.socwarden.com').replace(/\/+$/, '');
+    const rawEndpoint = (options.endpoint ?? 'https://ingestor.socwarden.com').replace(/\/+$/, '');
+
+    // SEC-FIX: Validate the endpoint URL for scheme safety and SSRF protection
+    // before storing it. Throws on: non-http/https schemes, private/loopback IPs.
+    validateEndpointURL(rawEndpoint);
+    this.endpoint = rawEndpoint;
+
+    // Warn if HTTP is used — API key will be in cleartext.
+    if (!this.endpoint.startsWith('https://')) {
+      console.warn('[SOCWarden] WARNING: Endpoint is using HTTP. API keys will be transmitted in cleartext.');
+    }
 
     // Validate timeout: must be a positive finite integer in [1, 300_000] ms.
     const rawTimeout = options.timeout ?? 5000;
@@ -62,14 +135,28 @@ export class SOCWardenClient {
       );
     }
     this.timeout = rawTimeout;
+  }
 
-    // D2 FIX: Enforce HTTPS to prevent API key transmission in cleartext.
-    if (!this.endpoint.startsWith('https://')) {
-      if (process.env.NODE_ENV === 'production') {
-        throw new Error('[SOCWarden] Endpoint must use HTTPS in production. API keys must not be transmitted in cleartext.');
-      }
-      console.warn('[SOCWarden] WARNING: Endpoint is using HTTP. API keys will be transmitted in cleartext.');
-    }
+  /**
+   * Prevent the API key from leaking via accidental serialization.
+   *
+   * TypeScript's `private` keyword is compile-time only — at runtime the
+   * `apiKey` property is a plain enumerable JS property. If the client
+   * instance is accidentally passed to JSON.stringify(), console.log() or
+   * Object spread, the key would be exposed. Overriding toJSON() and the
+   * Node.js inspect symbol returns a safe redacted representation instead.
+   */
+  toJSON(): Record<string, unknown> {
+    return {
+      '[SOCWardenClient]': true,
+      endpoint: this.endpoint,
+      apiKey: '[REDACTED]',
+    };
+  }
+
+  /** Safe representation for Node.js util.inspect / console.log. */
+  [Symbol.for('nodejs.util.inspect.custom')](): string {
+    return `SOCWardenClient { endpoint: '${this.endpoint}', apiKey: '[REDACTED]' }`;
   }
 
   // ---------------------------------------------------------------------------
@@ -382,9 +469,15 @@ export class SOCWardenClient {
       }
 
       if (!response.ok) {
-        const body = await response.text().catch(() => '');
+        // SEC-FIX (H1/H2): Read only the first MAX_ERROR_BODY_BYTES of the error body to
+        // prevent memory exhaustion DoS (a malicious server returning a giant response would
+        // otherwise be fully buffered by text()).  Then strip control characters (CR/LF) to
+        // prevent log injection — a crafted body could otherwise forge additional log lines
+        // that appear to originate from the SDK itself.
+        const rawBody = await response.text().catch(() => '');
+        const safeBody = sanitizeForLog(rawBody);
         console.warn(
-          `[SOCWarden] Event send failed (HTTP ${response.status}): ${body}`,
+          `[SOCWarden] Event send failed (HTTP ${response.status}): ${safeBody}`,
         );
       }
     } finally {

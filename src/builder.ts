@@ -119,11 +119,28 @@ export class EventBuilder {
    * ```
    */
   meta(key: string, value: unknown): this {
-    // Guard against __proto__ / constructor prototype-chain keys.
-    // A user-controlled key of '__proto__' passed to bracket-notation assignment
-    // (existing[key] = value) silently corrupts the object's prototype chain,
-    // causing JSON.stringify to produce {} and dropping all metadata.
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+    // Guard against prototype-chain keys passed via bracket-notation assignment.
+    // '__proto__', 'constructor', and 'prototype' are the classic pollution vectors,
+    // but inherited Object.prototype method names (valueOf, toString, hasOwnProperty,
+    // isPrototypeOf, propertyIsEnumerable, toLocaleString) can also shadow built-ins
+    // when set on a plain object, breaking downstream consumers that rely on them.
+    // We block all of them defensively.
+    const BLOCKED_KEYS = new Set([
+      '__proto__',
+      'constructor',
+      'prototype',
+      'valueOf',
+      'toString',
+      'toLocaleString',
+      'hasOwnProperty',
+      'isPrototypeOf',
+      'propertyIsEnumerable',
+      '__defineGetter__',
+      '__defineSetter__',
+      '__lookupGetter__',
+      '__lookupSetter__',
+    ]);
+    if (BLOCKED_KEYS.has(key)) {
       console.warn(`[SOCWarden] Metadata key "${key}" is reserved and will be ignored.`);
       return this;
     }
